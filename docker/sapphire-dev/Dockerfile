@@ -48,6 +48,7 @@ COPY --from=oasis-web3-gateway /go/oasis-web3-gateway/oasis-web3-gateway ${OASIS
 COPY --from=oasis-web3-gateway /go/oasis-web3-gateway/docker/common/oasis-deposit/oasis-deposit ${OASIS_DEPOSIT}
 COPY docker/common/localnet.yml ${OASIS_WEB3_GATEWAY_CONFIG_FILE}
 COPY docker/common/start.sh /
+COPY docker/common/initialize.sh /
 COPY tests/tools/* /
 
 # Configure oasis-node and oasis-net-runner.
@@ -84,4 +85,7 @@ EXPOSE 8545/tcp
 EXPOSE 8546/tcp
 
 USER root
+
+RUN /initialize.sh
+
 ENTRYPOINT ["/start.sh"]
