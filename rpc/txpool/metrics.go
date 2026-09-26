@@ -7,12 +7,13 @@ type metricsWrapper struct {
 }
 
 // Content implements API.
-func (m *metricsWrapper) Content() (res map[string][]interface{}, err error) {
+func (m *metricsWrapper) Content() (res map[string][]any, err error) {
 	r, s, f, i, d := metrics.GetAPIMethodMetrics("txpool_content")
 	defer metrics.InstrumentCaller(r, s, f, i, d, &err)()
 
 	res, err = m.api.Content()
-	return
+
+	return res, err
 }
 
 // NewMetricsWrapper returns an instrumanted API service.

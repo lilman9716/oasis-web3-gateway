@@ -128,7 +128,7 @@ func (s *Storage) InsertLogs(ctx context.Context, values []*Log) error {
 }
 
 // Upsert upserts a value.
-func (s *Storage) Upsert(ctx context.Context, value interface{}) error {
+func (s *Storage) Upsert(ctx context.Context, value any) error {
 	typ := reflect.TypeOf(value)
 	table := s.DB.Dialect().Tables().Get(typ)
 	pks := make([]string, len(table.PKs))
@@ -144,7 +144,7 @@ func (s *Storage) Upsert(ctx context.Context, value interface{}) error {
 	return err
 }
 
-// LogsUp does performes the 20220109122505_logs up migration.
+// LogsUp does performs the 20220109122505_logs up migration.
 func LogsUp(ctx context.Context, tx *bun.Tx) error {
 	logger := logging.GetLogger("migration")
 
@@ -165,10 +165,7 @@ func LogsUp(ctx context.Context, tx *bun.Tx) error {
 
 	for i := start; i <= end; i += batchSize {
 		bs := i
-		be := i + batchSize - 1
-		if be > end {
-			be = end
-		}
+		be := min(i+batchSize-1, end)
 
 		logger.Debug("migrating batch", "batch_start", bs, "batch_end", be)
 		// Fetch all logs for the batch rounds.

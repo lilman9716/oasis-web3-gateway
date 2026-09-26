@@ -1,3 +1,4 @@
+// Package migrations provides database migrations for the Oasis Web3 Gateway.
 package migrations
 
 import (
@@ -21,7 +22,7 @@ var migrations embed.FS
 
 // DropTables deletes all database tables in the `public` schema of the configured database.
 //
-// Note: this method assumes that PostgresSQL is used as the underlying db.
+// Note: this method assumes that PostgreSQL is used as the underlying db.
 func DropTables(ctx context.Context, db *bun.DB) error {
 	logger := logging.GetLogger("migration")
 
@@ -33,7 +34,7 @@ func DropTables(ctx context.Context, db *bun.DB) error {
 		return err
 	}
 
-	var results []map[string]interface{}
+	var results []map[string]any
 	if err = db.ScanRows(ctx, rows, &results); err != nil {
 		return err
 	}

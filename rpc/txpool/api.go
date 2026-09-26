@@ -1,9 +1,10 @@
+// Package txpool provides the Web3 JSON-RPC txpool API.
 package txpool
 
 // API is the txpool_ prefixed set of APIs in the Web3 JSON-RPC spec.
 type API interface {
 	// Content returns the (always empty) contents of the txpool.
-	Content() (map[string][]interface{}, error)
+	Content() (map[string][]any, error)
 }
 
 type publicAPI struct{}
@@ -13,8 +14,8 @@ func NewPublicAPI() API {
 	return &publicAPI{}
 }
 
-func (api *publicAPI) Content() (map[string][]interface{}, error) {
-	m := make(map[string][]interface{})
-	m["pending"] = []interface{}{}
+func (api *publicAPI) Content() (map[string][]any, error) {
+	m := make(map[string][]any)
+	m["pending"] = []any{}
 	return m, nil
 }

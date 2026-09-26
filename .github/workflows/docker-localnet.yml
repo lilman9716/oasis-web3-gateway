@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # We need history to determine oasis-web3-gateway version from git tag.
           fetch-depth: 0
@@ -64,6 +64,7 @@ jobs:
             ghcr.io/oasisprotocol/${{ matrix.docker_image }}:latest
             ghcr.io/oasisprotocol/${{ matrix.docker_image }}:latest-${{ env.VERSION }}
           push: true
+          provenance: false
           labels: |
             org.opencontainers.image.source=${{ github.event.repository.html_url }}
             org.opencontainers.image.revision=${{ github.sha }}

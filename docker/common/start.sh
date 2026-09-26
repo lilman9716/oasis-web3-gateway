@@ -5,16 +5,37 @@
 # ParaTime.
 # Supported ENV Variables:
 # - all ENV variables required by spinup-oasis-stack.sh
+# - TO (optional): comma-separated deposit addresses (0x or oasis1 format) or mnemonic.
+# - N (optional): number of addresses to derive from mnemonic.
+# - AMOUNT (optional): Amount to deposit in ParaTime base units.
 # - OASIS_WEB3_GATEWAY_BINARY: path to oasis-web3-gateway binary
 # - OASIS_WEB3_GATEWAY_CONFIG_FILE: path to oasis-web3-gateway config file
-# - OASIS_DEPOSIT_BINARY: path to oasis-deposit binary
 # - BEACON_BACKEND: beacon epoch transition mode 'mock' (default) or 'default'
 # - OASIS_SINGLE_COMPUTE_NODE (default: true): if non-empty only run a single compute node
 # - OASIS_CLI_BINARY (optional): path to oasis binary. If provided, Oasis CLI will be configured for Localnet
 # - ENVOY_BINARY (optional): path to Envoy binary. If provided, Envoy proxy to Oasis Client node will be started
 # - ENVOY_CONFIG_FILE: path to Envoy config file. Required if ENVOY_BINARY is provided
+# - OASIS_NEXUS_BINARY: path to oasis-nexus binary
+# - OASIS_NEXUS_CONFIG_FILE: path to oasis-nexus config file. Required if OASIS_NEXUS_BINARY is provided
+# - OASIS_EXPLORER_DIR: path to explorer (nexus frontend) directory
+# - OASIS_EXPLORER_NGINX_CONFIG_FILE: path to explorer nginx config file.
 
 rm -f /CONTAINER_READY
+
+# Localnet requires x86_64; other architectures lack compatible binaries.
+ARCH=$(uname -m)
+if [[ "${ARCH}" != "x86_64" ]]; then
+  echo "ERROR: ${ARCH} is not supported. Please run this image with '--platform linux/amd64'."
+  exit 1
+fi
+
+export TO=${TO:-""}
+
+export N=${N:-"5"}
+
+export AMOUNT=${AMOUNT:-"10_000"}
+
+export OASIS_DOCKER_START_EXPLORER=${OASIS_DOCKER_START_EXPLORER:-yes}
 
 export OASIS_DOCKER_NO_GATEWAY=${OASIS_DOCKER_NO_GATEWAY:-no}
 
@@ -25,6 +46,8 @@ export OASIS_DOCKER_USE_TIMESTAMPS_IN_NOTICES=${OASIS_DOCKER_USE_TIMESTAMPS_IN_N
 export OASIS_DOCKER_DEBUG_DISK_AND_CPU_USAGE=${OASIS_DOCKER_DEBUG_DISK_AND_CPU_USAGE:-no}
 
 export OASIS_SINGLE_COMPUTE_NODE=${OASIS_SINGLE_COMPUTE_NODE:-1}
+
+export EXPLORER_PORT=${EXPLORER_PORT:-8548}
 
 OASIS_WEB3_GATEWAY_VERSION=$(${OASIS_WEB3_GATEWAY_BINARY} -v | head -n1 | cut -d " " -f 3 | sed -r 's/^v//')
 OASIS_CORE_VERSION=$(${OASIS_NODE_BINARY} -v | head -n1 | cut -d " " -f 3 | sed -r 's/^v//')
@@ -41,6 +64,9 @@ OASIS_KM_SOCKET=${OASIS_NODE_DATADIR}/net-runner/network/keymanager-0/internal.s
 OASIS_WEB3_GATEWAY_PID=""
 OASIS_NODE_PID=""
 ENVOY_PID=""
+NEXUS_PID=""
+EXPLORER_PID=""
+SOCAT_PID=""
 
 set -euo pipefail
 
@@ -53,6 +79,15 @@ function cleanup {
   fi
   if [[ -n "${ENVOY_PID}" ]]; then
     kill -9 ${ENVOY_PID}
+  fi
+  if [[ -n "${NEXUS_PID}" ]]; then
+    kill -9 ${NEXUS_PID}
+  fi
+  if [[ -n "${EXPLORER_PID}" ]]; then
+    kill -9 ${EXPLORER_PID}
+  fi
+  if [[ -n "${SOCAT_PID}" ]]; then
+    kill -9 ${SOCAT_PID}
   fi
 }
 
@@ -105,20 +140,149 @@ else
   }
 fi
 
+# Parse command-line arguments for test account population at the beginning,
+# so that we exit early if there are any errors.
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -amount)
+      # Amount to deposit in ParaTime base units.
+      AMOUNT="$2"
+      shift
+      shift
+      ;;
+    -to)
+      # Comma-separated deposit addresses (0x or oasis1 format) or mnemonic.
+      # If empty, a new mnemonic will be generated.
+      TO="$2"
+      shift
+      shift
+      ;;
+    -test-mnemonic)
+      # Use the standard test mnemonic.
+      TO="test test test test test test test test test test test junk"
+      shift
+      ;;
+    -n)
+      # Number of addresses to derive from mnemonic.
+      N="$2"
+      shift
+      shift
+      ;;
+    --no-explorer)
+      # Don't start explorer and indexer.
+      OASIS_DOCKER_START_EXPLORER="no"
+      shift
+      ;;
+    --no-gateway)
+      # Don't start web3 gateway.
+      OASIS_DOCKER_NO_GATEWAY="yes"
+      shift
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      exit 1;
+      ;;
+  esac
+done
+
+function populate_accounts() {
+  # Remove underscores from amount, as those are only there to make it easier
+  # for humans to parse the amount.
+  AMOUNT=$(echo "${AMOUNT}" | tr -d '_')
+
+  # If no mnemonic specified, use the test mnemonic.
+  if [[ -z ${TO} ]]; then
+    TO="test test test test test test test test test test test junk"
+ fi
+
+  if [[ ${TO} == *,* ]]; then
+    # List of addresses provided, fund these.
+    IFS=","
+    for addr in ${TO};
+    do
+      ${OASIS_CLI_BINARY} account deposit ${AMOUNT} ${addr} --account test:alice --gas-price 0 -y > /dev/null 2>&1
+    done
+    IFS=" "
+  elif [[ ${TO} =~ [[:space:]] ]]; then
+    # Mnemonic provided, generate N derivative accounts and fund them.
+    for n in $(seq 0 $((N-1)))
+    do
+      acct="account$n"
+      ${OASIS_CLI_BINARY} wallet import ${acct} --algorithm secp256k1-bip44 --number ${n} --secret "${TO}" -y > /dev/null 2>&1
+      ${OASIS_CLI_BINARY} account deposit ${AMOUNT} ${acct} --account test:alice --gas-price 0 -y > /dev/null 2>&1
+    done
+
+    ACCT_OUT=""
+    PK_OUT=""
+    for n in $(seq 0 $((N-1)))
+    do
+      acct="account$n"
+
+      # Parse Ethereum address and private key from output.
+      IFS="#"
+      out=$(${OASIS_CLI_BINARY} wallet export ${acct} -y 2>/dev/null)
+      eth_addr=$(echo "${out}" | grep -e '^Ethereum address:' | cut -d':' -f2 | awk '{$1=$1};1')
+      pk=$(echo "${out}" | tail -1)
+      IFS=" "
+
+      if [[ $n != 0 ]]; then
+        ACCT_OUT="${ACCT_OUT} "
+        PK_OUT="${PK_OUT} "
+      fi
+      ACCT_OUT="${ACCT_OUT}${eth_addr}"
+      PK_OUT="${PK_OUT}${pk}"
+    done
+
+    echo "Available Accounts"
+    echo "=================="
+    i=0
+    for a in ${ACCT_OUT};
+    do
+      echo "($i) $a (${AMOUNT} TEST)"
+      i=$((i+1))
+    done
+
+    echo
+    echo "Private Keys"
+    echo "=================="
+    i=0
+    for pk in ${PK_OUT};
+    do
+      echo "($i) 0x$pk"
+      i=$((i+1))
+    done
+
+    echo
+    echo "HD Wallet"
+    echo "=================="
+    echo "Mnemonic:     ${TO}"
+    echo "Base HD Path: m/44'/60'/0'/0/%d"
+  fi
+}
+
 T_START="$(date +%s)"
 
 if [[ "${PARATIME_NAME}" == "sapphire" ]]; then
-  ROFLS=($(ls /rofls/*.orc 2>/dev/null || exit 0))
-  if [[ ${#ROFLS[@]} -eq 0 ]]; then
+  if [ ! -f "/rofls/rofl.yaml" ]; then
     notice "No ROFLs detected.\n"
   else
+    TEE=$(yq -r .tee /rofls/rofl.yaml)
+    if [[ "${TEE}" == "tdx" ]]; then
+      ROFLS=("/rofl-appd-localnet.localnet.orc")
+      notice "TDX ROFL detected. Localnet appd service will be accessible via UNIX socket and TCP port\n"
+    elif [[ "${TEE}" == "sgx" ]]; then
+      ROFLS=($(ls /rofls/*.orc 2>/dev/null || exit 0))
+      notice "Detected SGX ROFL bundle: ${ROFLS[0]}\n"
+    else
+      notice "Invalid tee kind in rofl.yaml: ${TEE}. Aborting.\n"
+      exit -1
+    fi
     unzip -q "${ROFLS[0]}" "app.elf"
     mv "app.elf" "rofl.elf"
     # Create a dummy, non-empty SGXS for mock sgx.
     echo "dummy" > "rofl.sgxs"
     export ROFL_BINARY="/rofl.elf"
     export ROFL_BINARY_SGXS="/rofl.sgxs"
-    notice "Detected ROFL bundle: ${ROFLS[0]}\n"
   fi
 fi
 
@@ -161,7 +325,7 @@ if [[ "x${OASIS_DOCKER_NO_GATEWAY}" == "xyes" ]]; then
   notice "Skipping oasis-web3-gateway start-up...\n"
 else
   notice "Starting oasis-web3-gateway...\n"
-  ${OASIS_WEB3_GATEWAY_BINARY} --config ${OASIS_WEB3_GATEWAY_CONFIG_FILE} 2>1 &>/var/log/oasis-web3-gateway.log &
+  LOG__LEVEL=${OASIS_NODE_LOG_LEVEL} ${OASIS_WEB3_GATEWAY_BINARY} --config ${OASIS_WEB3_GATEWAY_CONFIG_FILE} 2>1 &>/var/log/oasis-web3-gateway.log &
   OASIS_WEB3_GATEWAY_PID=$!
 fi
 
@@ -172,14 +336,32 @@ if [[ "${BEACON_BACKEND}" == "mock" ]]; then
   notice_debug -l "Waiting for nodes to be ready..."
   ${OASIS_NODE_BINARY} debug control wait-nodes -n 2 -a unix:${OASIS_NODE_SOCKET}
 
+  if [[ "${PARATIME_NAME}" == "sapphire" ]]; then
+    echo -n .
+    # The key manager registers before it is fully ready, so the previous 'wait-nodes' check is not sufficient.
+    # Ensure the key manager is fully ready before moving to the first epoch.
+    notice_debug -l "Waiting for key manager to start up..."
+    ${OASIS_NODE_BINARY} debug control wait-ready -a unix:${OASIS_KM_SOCKET}
+
+    # Store the keymanager's runtime extra_info to monitor for changes during epoch 1.
+    km_extra_info=$(${OASIS_NODE_BINARY} control status -a unix:${OASIS_KM_SOCKET} | jq -r '.registration.descriptor.runtimes[0].extra_info')
+  fi
+
   echo -n .
   notice_debug -l "Setting epoch to 1..."
   ${OASIS_NODE_BINARY} debug control set-epoch --epoch 1 -a unix:${OASIS_NODE_SOCKET}
 
-  # Transition to the final epoch when the KM generates ephemeral secret.
   if [[ "${PARATIME_NAME}" == "sapphire" ]]; then
+    # Ensure ephemeral secret has been generated.
     notice_debug -l "Waiting for key manager to generate ephemeral secret..."
     while (${OASIS_NODE_BINARY} control status -a unix:${OASIS_KM_SOCKET} | jq -e ".keymanager.secrets.worker.ephemeral_secrets.last_generated_epoch!=2" >/dev/null); do
+      sleep 0.5
+    done
+
+    # Ensure the keymanager has re-registered with updated extra_info.
+    # This ensures that we wait until the master secret has been proposed and confirmed.
+    notice_debug -l "Waiting for key manager to generate master secret and re-register..."
+    while [[ $(${OASIS_NODE_BINARY} control status -a unix:${OASIS_KM_SOCKET} | jq -r '.registration.descriptor.runtimes[0].extra_info') == "${km_extra_info}" ]]; do
       sleep 0.5
     done
   fi
@@ -187,6 +369,7 @@ if [[ "${BEACON_BACKEND}" == "mock" ]]; then
   echo -n .
   notice_debug -l "Setting epoch to 2..."
   ${OASIS_NODE_BINARY} debug control set-epoch --epoch 2 -a unix:${OASIS_NODE_SOCKET}
+
 else
   echo -n ...
   notice_debug -l "Waiting for nodes to be ready..."
@@ -203,12 +386,6 @@ if [[ "x${OASIS_DOCKER_NO_GATEWAY}" != "xyes" && "${PARATIME_NAME}" == "sapphire
       http://127.0.0.1:8545 2>1 | jq -e '.result | has("key")' 2>1 &>/dev/null
   }
   until is_km_ready; do
-    if [[ "${BEACON_BACKEND}" == "mock" ]]; then
-      epoch=`${OASIS_NODE_BINARY} control status -a unix:${OASIS_NODE_SOCKET} | jq '.consensus.latest_epoch'`
-      epoch=$((epoch + 1))
-      ${OASIS_NODE_BINARY} debug control set-epoch --epoch $epoch -a unix:${OASIS_NODE_SOCKET}
-    fi
-
     echo -n .
     sleep 1
   done
@@ -218,17 +395,50 @@ else
   sleep 10
 fi
 
-notice "Populating accounts...\n\n"
-${OASIS_DEPOSIT_BINARY} -sock unix:${OASIS_NODE_SOCKET} "$@"
+# Once everything is initialized and setup, start Nexus and Explorer if enabled.
+if [[ "${OASIS_DOCKER_START_EXPLORER}" == "yes" ]]; then
+  notice "Creating database 'nexus'\n"
+  su -c "createdb -h 127.0.0.1 -p 5432 -U postgres nexus" postgres
 
-T_END="$(date +%s)"
+  notice "Waiting for Nexus to start"
+  # Configure Nexus config file.
+  chain_context=$(${OASIS_NODE_BINARY} control status -a unix:${OASIS_NODE_SOCKET} | jq -r .consensus.chain_context)
+  sed -i 's/{{CHAIN_CONTEXT}}/'"${chain_context}"'/g' ${OASIS_NEXUS_CONFIG_FILE}
+  sed -i 's/{{LOG_LEVEL}}/'"${OASIS_NODE_LOG_LEVEL}"'/g' ${OASIS_NEXUS_CONFIG_FILE}
+  sed -i 's/{{PARATIME_NAME}}/'"${PARATIME_NAME}"'/g' ${OASIS_NEXUS_CONFIG_FILE}
+
+  ${OASIS_NEXUS_BINARY} --config ${OASIS_NEXUS_CONFIG_FILE} 2>1 &>/var/log/nexus.log &
+  NEXUS_PID=$!
+
+  # Wait for Oasis Nexus to start.
+  while ! curl -s http://localhost:8547/ 2>1 &>/dev/null; do echo -n .; sleep 1; done
+  echo
+
+  notice "Waiting for Explorer to start"
+  # Configure the nginx config file.
+  sed -i 's|{{EXPLORER_PORT}}|'"${EXPLORER_PORT}"'|g' "${OASIS_EXPLORER_NGINX_CONFIG_FILE}"
+  sed -i 's|{{EXPLORER_DIR}}|'"${OASIS_EXPLORER_DIR}"'|g' "${OASIS_EXPLORER_NGINX_CONFIG_FILE}"
+  ln -s ${OASIS_EXPLORER_NGINX_CONFIG_FILE} /etc/nginx/sites-enabled/explorer
+  service nginx start 2>1 &>/dev/null
+  nginx -s reload 2>1 &>/dev/null
+
+  # Wait for Explorer to start.
+  while ! curl -s http://localhost:${EXPLORER_PORT}/ 2>1 &>/dev/null; do echo -n .; sleep 1; done
+  echo
+fi
 
 # Add Localnet to Oasis CLI and make it default.
 if [ ! -z "${OASIS_CLI_BINARY:-}" ]; then
-  ${OASIS_CLI_BINARY} network add-local localnet unix:/serverdir/node/net-runner/network/client-0/internal.sock -y
+  # XXX: Fix to absolute socket path once https://github.com/oasisprotocol/cli/issues/471 is fixed.
+  ${OASIS_CLI_BINARY} network add-local localnet unix:serverdir/node/net-runner/network/client-0/internal.sock -y
   ${OASIS_CLI_BINARY} paratime add localnet ${PARATIME_NAME} 8000000000000000000000000000000000000000000000000000000000000000 --num-decimals 18 -y
   ${OASIS_CLI_BINARY} network set-default localnet
 fi
+
+
+notice "Populating accounts...\n\n"
+populate_accounts
+
 
 # Register ROFL and fund accounts.
 if [ ! -z "${ROFL_BINARY:-}" ]; then
@@ -243,39 +453,51 @@ if [ ! -z "${ROFL_BINARY:-}" ]; then
   ROFL_ADMIN_FUND=10001
   COMPUTE_NODE_ADDRESS="oasis1qp6tl30ljsrrqnw2awxxu2mtxk0qxyy2nymtsy90"
   COMPUTE_NODE_FUND=1000
-  POLICY_PATH=/policy-localnet.yml
+  ROFL_MANIFEST_PATH=rofl.yaml
 
   echo
   notice "Configuring ROFL ${ROFLS[0]}:\n"
-  printf "   Enclave ID: ${CYAN}${ROFL_ENCLAVE_ID}${OFF}\n"
-
-  ${OASIS_CLI_BINARY} account deposit ${ROFL_ADMIN_FUND} ${ROFL_ADMIN} --account test:alice --gas-price 0 -y >/dev/null
+  ${OASIS_CLI_BINARY} account deposit ${ROFL_ADMIN_FUND} ${ROFL_ADMIN} --account test:alice --gas-price 0 -y > /dev/null 2>&1
   printf "   ROFL admin ${CYAN}${ROFL_ADMIN}${OFF} funded ${ROFL_ADMIN_FUND} TEST\n"
 
-  ${OASIS_CLI_BINARY} account deposit ${COMPUTE_NODE_FUND} ${COMPUTE_NODE_ADDRESS} --account test:alice --gas-price 0 -y >/dev/null
+  ${OASIS_CLI_BINARY} account deposit ${COMPUTE_NODE_FUND} ${COMPUTE_NODE_ADDRESS} --account test:alice --gas-price 0 -y > /dev/null 2>&1
   printf "   Compute node ${CYAN}${COMPUTE_NODE_ADDRESS}${OFF} funded ${COMPUTE_NODE_FUND} TEST\n"
 
-  cat > ${POLICY_PATH} << EOF
-quotes:
-  pcs:
-    tcb_validity_period: 30
-    min_tcb_evaluation_data_number: 16
-enclaves:
-  - "${ROFL_ENCLAVE_ID}"
-endorsements:
-  - any: {}
-fees: endorsing_node
-max_expiration: 3
-EOF
   # XXX: Report ROFL app ID in JSON and properly parse it.
-  ROFL_APP_ID=$(${OASIS_CLI_BINARY} rofl create ${POLICY_PATH} --account ${ROFL_ADMIN} --scheme cn -y | tail -n1 | rev | cut -d' ' -f1 | rev)
+  ${OASIS_CLI_BINARY} rofl init --tee sgx --kind raw > /dev/null 2>&1
+  ROFL_APP_ID=$(${OASIS_CLI_BINARY} rofl create --account ${ROFL_ADMIN} --network localnet -y 2>/dev/null | grep "Created ROFL app" | rev | cut -d' ' -f1 | rev)
   printf "   App ID: ${CYAN}${ROFL_APP_ID}${OFF}\n"
+
+  # Submit the hardcoded enclave ID to the chain.
+  sed -i "s@      enclaves: \[\]@      enclaves:\n        - id: ${ROFL_ENCLAVE_ID}@" ${ROFL_MANIFEST_PATH}
+  ${OASIS_CLI_BINARY} rofl update -y > /dev/null 2>&1
+  printf "   Enclave ID: ${CYAN}${ROFL_ENCLAVE_ID}${OFF}\n"
+
+  # Bridge rofl-appd Unix socket to TCP for macOS host access (TDX only).
+  if [[ "${TEE}" == "tdx" ]]; then
+    while [[ ! -S /rofls/rofl-appd.sock ]]; do sleep 1; done
+    socat TCP-LISTEN:8549,reuseaddr,fork UNIX-CONNECT:/rofls/rofl-appd.sock &
+    SOCAT_PID=$!
+  fi
 fi
+
+T_END="$(date +%s)"
 
 echo
 printf "${YELLOW}WARNING: The chain is running in ephemeral mode. State will be lost after restart!${OFF}\n\n"
 notice "GRPC listening on ${CYAN}http://localhost:8544${OFF}.\n"
-notice "Web3 RPC listening on ${CYAN}http://localhost:8545${OFF} and ${CYAN}ws://localhost:8546${OFF}. Chain ID: ${GATEWAY__CHAIN_ID}.\n"
+
+if [[ "${OASIS_DOCKER_NO_GATEWAY}" == "no" ]]; then
+  notice "Web3 RPC listening on ${CYAN}http://localhost:8545${OFF} and ${CYAN}ws://localhost:8546${OFF}. Chain ID: ${GATEWAY__CHAIN_ID}.\n"
+fi
+if [[ "${OASIS_DOCKER_START_EXPLORER}" == "yes" ]]; then
+  notice "Nexus API listening on ${CYAN}http://localhost:8547${OFF}.\n"
+  notice "Localnet Explorer available at ${CYAN}http://localhost:${EXPLORER_PORT}${OFF}.\n"
+fi
+if [[ -n "${SOCAT_PID}" ]]; then
+  notice "ROFL appd listening on ${CYAN}rofl-appd.sock${OFF} and ${CYAN}http://localhost:8549${OFF}.\n"
+fi
+
 notice "Container start-up took ${CYAN}$((T_END-T_START))${OFF} seconds, node log level is set to ${CYAN}${OASIS_NODE_LOG_LEVEL}${OFF}.\n"
 
 touch /CONTAINER_READY

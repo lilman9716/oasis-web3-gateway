@@ -1,3 +1,4 @@
+// Package indexer provides the indexer backend implementation.
 package indexer
 
 import (
@@ -62,7 +63,7 @@ type GetEthInfoBackend interface {
 	GetBlockTransactionCountByRound(ctx context.Context, round uint64) (int, error)
 	GetBlockTransactionCountByHash(ctx context.Context, blockHash ethcommon.Hash) (int, error)
 	GetTransactionByBlockHashAndIndex(ctx context.Context, blockHash ethcommon.Hash, txIndex int) (*model.Transaction, error)
-	GetTransactionReceipt(ctx context.Context, txHash ethcommon.Hash) (map[string]interface{}, error)
+	GetTransactionReceipt(ctx context.Context, txHash ethcommon.Hash) (map[string]any, error)
 	BlockNumber(ctx context.Context) (uint64, error)
 	GetLogs(ctx context.Context, startRound, endRound uint64) ([]*model.Log, error)
 }
@@ -84,7 +85,7 @@ type Backend interface {
 		ctx context.Context,
 		oasisBlock *block.Block,
 		txResults []*client.TransactionWithResults,
-		blockGasLimit uint64,
+		coreParameters *core.Parameters,
 		rtInfo *core.RuntimeInfoResponse,
 	) error
 
@@ -141,10 +142,10 @@ func (ib *indexBackend) SetObserver(ob BackendObserver) {
 }
 
 // Index indexes oasis block.
-func (ib *indexBackend) Index(ctx context.Context, oasisBlock *block.Block, txResults []*client.TransactionWithResults, blockGasLimit uint64, rtInfo *core.RuntimeInfoResponse) error {
+func (ib *indexBackend) Index(ctx context.Context, oasisBlock *block.Block, txResults []*client.TransactionWithResults, coreParameters *core.Parameters, rtInfo *core.RuntimeInfoResponse) error {
 	round := oasisBlock.Header.Round
 
-	err := ib.StoreBlockData(ctx, oasisBlock, txResults, blockGasLimit)
+	err := ib.StoreBlockData(ctx, oasisBlock, txResults, coreParameters)
 	if err != nil {
 		ib.logger.Error("generateEthBlock failed", "err", err)
 		return err
@@ -205,7 +206,7 @@ func (ib *indexBackend) blockNumberFromRound(ctx context.Context, round uint64) 
 	default:
 		number = round
 	}
-	return
+	return number, err
 }
 
 // QueryBlockRound returns block number for the provided hash.
@@ -319,7 +320,7 @@ func (ib *indexBackend) GetTransactionByBlockHashAndIndex(ctx context.Context, b
 }
 
 // GetTransactionReceipt returns the receipt for the given tx.
-func (ib *indexBackend) GetTransactionReceipt(ctx context.Context, txHash ethcommon.Hash) (map[string]interface{}, error) {
+func (ib *indexBackend) GetTransactionReceipt(ctx context.Context, txHash ethcommon.Hash) (map[string]any, error) {
 	dbReceipt, err := ib.storage.GetTransactionReceipt(ctx, txHash.String())
 	if err != nil {
 		return nil, err

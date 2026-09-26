@@ -55,6 +55,19 @@ func Logs2EthLogs(logs []*Log, round uint64, blockHash, txHash common.Hash, star
 	return ethLogs
 }
 
+// Taken from https://github.com/ethereum/go-ethereum/blob/6b6261b51fa46f7ed36d0589db641c14569ce036/core/types/bloom9.go#L118-L129
+// Which was removed in: https://github.com/ethereum/go-ethereum/pull/31129 from go-ethereum.
+func logsBloom(logs []*ethtypes.Log) []byte {
+	var bin ethtypes.Bloom
+	for _, log := range logs {
+		bin.Add(log.Address.Bytes())
+		for _, b := range log.Topics {
+			bin.Add(b[:])
+		}
+	}
+	return bin[:]
+}
+
 // ethToModelLogs converts ethereum logs to DB model logs.
 func ethToModelLogs(ethLogs []*ethtypes.Log) ([]*model.Log, map[string][]*model.Log) {
 	res := make([]*model.Log, 0, len(ethLogs))
@@ -94,6 +107,7 @@ func blockToModels(
 	txsGas []txGas,
 	results []types.CallResult,
 	blockGasLimit uint64,
+	baseFee *big.Int,
 ) (*model.Block, []*model.Transaction, []*model.Receipt, []*model.Log, error) {
 	dbLogs, txLogs := ethToModelLogs(logs)
 
@@ -101,10 +115,9 @@ func blockToModels(
 	bhash := common.HexToHash(encoded.Hex()).String()
 	bprehash := block.Header.PreviousHash.Hex()
 	bshash := block.Header.StateRoot.Hex()
-	logsBloom := ethtypes.BytesToBloom(ethtypes.LogsBloom(logs))
+	logsBloom := ethtypes.BytesToBloom(logsBloom(logs))
 	bloomData, _ := logsBloom.MarshalText()
 	bloomHex := hex.EncodeToString(bloomData)
-	baseFee := big.NewInt(10)
 	var btxHash string
 	if len(transactions) == 0 {
 		btxHash = ethtypes.EmptyRootHash.Hex()
@@ -136,7 +149,14 @@ func blockToModels(
 	for idx, ethTx := range transactions {
 		ethTxHex := ethTx.Hash().Hex()
 		v, r, s := ethTx.RawSignatureValues()
-		signer := ethtypes.LatestSignerForChainID(ethTx.ChainId())
+		chainID := ethTx.ChainId()
+		if chainID != nil && chainID.Cmp(big.NewInt(0)) == 0 {
+			// Legacy transactions don't have a chain ID but `ChainId()` returns 0, which is invalid
+			// for `LatestSignerForChainId` which expects a null in that case (zero causes a panic).
+			// https://github.com/ethereum/go-ethereum/issues/31653
+			chainID = nil
+		}
+		signer := ethtypes.LatestSignerForChainID(chainID)
 		from, _ := signer.Sender(ethTx)
 		ethAccList := ethTx.AccessList()
 		accList := make([]model.AccessTuple, 0, len(ethAccList))
@@ -227,7 +247,7 @@ type txGas struct {
 }
 
 // StoreBlockData parses oasis block and stores in db.
-func (ib *indexBackend) StoreBlockData(ctx context.Context, oasisBlock *block.Block, txResults []*client.TransactionWithResults, blockGasLimit uint64) error { //nolint: gocyclo
+func (ib *indexBackend) StoreBlockData(ctx context.Context, oasisBlock *block.Block, txResults []*client.TransactionWithResults, coreParameters *core.Parameters) error { //nolint: gocyclo
 	encoded := oasisBlock.Header.EncodedHash()
 	bhash := common.HexToHash(encoded.Hex())
 	blockNum := oasisBlock.Header.Round
@@ -363,7 +383,7 @@ func (ib *indexBackend) StoreBlockData(ctx context.Context, oasisBlock *block.Bl
 				// Ignore any other events.
 			}
 		}
-		logs = append(logs, Logs2EthLogs(oasisLogs, blockNum, bhash, ethTx.Hash(), uint(len(logs)), uint32(txIndex))...)
+		logs = append(logs, Logs2EthLogs(oasisLogs, blockNum, bhash, ethTx.Hash(), uint(len(logs)), uint32(len(ethTxs)-1))...)
 
 		// Emerald GasUsed events were added in version 7.0.0.
 		// Default to using gas limit, which was the behaviour before.
@@ -387,7 +407,14 @@ func (ib *indexBackend) StoreBlockData(ctx context.Context, oasisBlock *block.Bl
 	}
 
 	// Convert to DB models.
-	blk, txs, receipts, dbLogs, err := blockToModels(oasisBlock, ethTxs, logs, txsStatus, txsGas, results, blockGasLimit)
+	var minGasPrice big.Int
+	var blockGasLimit uint64
+	if coreParameters != nil {
+		mgp := coreParameters.MinGasPrice[types.NativeDenomination]
+		minGasPrice = *mgp.ToBigInt()
+		blockGasLimit = coreParameters.MaxBatchGas
+	}
+	blk, txs, receipts, dbLogs, err := blockToModels(oasisBlock, ethTxs, logs, txsStatus, txsGas, results, blockGasLimit, &minGasPrice)
 	if err != nil {
 		ib.logger.Debug("Failed to ConvertToEthBlock", "height", blockNum, "err", err)
 		return err
@@ -496,8 +523,12 @@ func (ib *indexBackend) StoreBlockData(ctx context.Context, oasisBlock *block.Bl
 		Hash:  bhash,
 		Logs:  dbLogs,
 	}
-	ib.subscribe.ChainChan() <- chainEvent
-	ib.logger.Debug("sent chain event to event system", "height", blockNum)
+	select {
+	case ib.subscribe.ChainChan() <- chainEvent:
+		ib.logger.Debug("sent chain event to event system", "height", blockNum)
+	default:
+		ib.logger.Debug("dropping chain event, no subscribers", "height", blockNum)
+	}
 
 	bd := &BlockData{
 		Block:                     blk,
@@ -516,7 +547,7 @@ func (ib *indexBackend) StoreBlockData(ctx context.Context, oasisBlock *block.Bl
 }
 
 // db2EthReceipt converts model.Receipt to the GetTransactionReceipt format.
-func db2EthReceipt(dbReceipt *model.Receipt) map[string]interface{} {
+func db2EthReceipt(dbReceipt *model.Receipt) map[string]any {
 	ethLogs := make([]*ethtypes.Log, 0, len(dbReceipt.Logs))
 	for _, dbLog := range dbReceipt.Logs {
 		topics := make([]common.Hash, 0, len(dbLog.Topics))
@@ -542,10 +573,10 @@ func db2EthReceipt(dbReceipt *model.Receipt) map[string]interface{} {
 	}
 
 	effectiveGasPrice, _ := new(big.Int).SetString(dbReceipt.EffectiveGasPrice, 10)
-	receipt := map[string]interface{}{
+	receipt := map[string]any{
 		"status":            hexutil.Uint(dbReceipt.Status),
 		"cumulativeGasUsed": hexutil.Uint64(dbReceipt.CumulativeGasUsed),
-		"logsBloom":         ethtypes.BytesToBloom(ethtypes.LogsBloom(ethLogs)),
+		"logsBloom":         ethtypes.BytesToBloom(logsBloom(ethLogs)),
 		"logs":              ethLogs,
 		"transactionHash":   dbReceipt.TransactionHash,
 		"gasUsed":           hexutil.Uint64(dbReceipt.GasUsed),

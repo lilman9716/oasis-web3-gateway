@@ -6,7 +6,8 @@ set up localnet for developing dApps running on Sapphire or Emerald:
 - oasis-node and oasis-net-runner
 - Sapphire or Emerald ParaTime .orc bundles
 - oasis-web3-gateway
-- oasis-deposit helper to fund local development accounts
+- Oasis CLI for funding initial accounts
+- Oasis Nexus indexer and Explorer frontend
 
 ## Prebuilt images
 
@@ -19,8 +20,8 @@ images. `latest` versions are based on:
 To use the precompiled images, run:
 
 ```sh
-docker run -it -p8545:8545 -p8546:8546 ghcr.io/oasisprotocol/sapphire-localnet # Sapphire
-docker run -it -p8545:8545 -p8546:8546 ghcr.io/oasisprotocol/emerald-localnet # Emerald
+docker run -it -p8544-8548:8544-8548 ghcr.io/oasisprotocol/sapphire-localnet # Sapphire
+docker run -it -p8544-8548:8544-8548 ghcr.io/oasisprotocol/emerald-localnet # Emerald
 ```
 
 ### Mac M Chips
@@ -29,8 +30,8 @@ There is currently no arm64 build available for M Macs, so make sure to force th
 like this:
 
 ```sh
-docker run -it -p8545:8545 -p8546:8546 --platform linux/x86_64 ghcr.io/oasisprotocol/sapphire-localnet # Sapphire
-docker run -it -p8545:8545 -p8546:8546 --platform linux/x86_64 ghcr.io/oasisprotocol/emerald-localnet # Emerald
+docker run -it -p8544-8548:8544-8548 --platform linux/x86_64 ghcr.io/oasisprotocol/sapphire-localnet # Sapphire
+docker run -it -p8544-8548:8544-8548 --platform linux/x86_64 ghcr.io/oasisprotocol/emerald-localnet # Emerald
 ```
 ## Build image locally
 
@@ -44,8 +45,8 @@ make docker
 To run the compiled image type:
 
 ```sh
-docker run -it -p8545:8545 -p8546:8546 ghcr.io/oasisprotocol/sapphire-localnet:local
-docker run -it -p8545:8545 -p8546:8546 ghcr.io/oasisprotocol/emerald-localnet:local
+docker run -it -p8544-8548:8544-8548 ghcr.io/oasisprotocol/sapphire-localnet:local
+docker run -it -p8544-8548:8544-8548 ghcr.io/oasisprotocol/emerald-localnet:local
 ```
 
 ## Usage
@@ -62,6 +63,10 @@ By default, a random mnemonic will be generated and the first 5 accounts will
 be funded 10,000 TEST. Flags `-amount`, `-to`, `-n` can be added to specify an
 initial ROSE deposit, existing mnemonic and the number of addresses to derive
 and fund respectively.
+
+By passing `--no-explorer`, the Explorer frontend and Nexus indexer won't be
+started (useful if you want to reduce the container startup time a bit,
+e.g. for CI tests).
 
 WARNING: The image is running in *ephemeral mode*. A new chain state will be
 initialized each time you start the container!

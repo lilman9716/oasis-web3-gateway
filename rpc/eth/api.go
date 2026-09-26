@@ -1,3 +1,4 @@
+// Package eth provides the Web3 JSON-RPC Ethereum API.
 package eth
 
 import (
@@ -5,12 +6,15 @@ import (
 	"context"
 	"crypto/sha512"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/math"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/filters"
 	ethrpc "github.com/ethereum/go-ethereum/rpc"
@@ -18,9 +22,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-sdk/client-sdk/go/client"
 	"github.com/oasisprotocol/oasis-sdk/client-sdk/go/crypto/signature/secp256k1"
-	"github.com/oasisprotocol/oasis-sdk/client-sdk/go/modules/accounts"
-	"github.com/oasisprotocol/oasis-sdk/client-sdk/go/modules/core"
-	"github.com/oasisprotocol/oasis-sdk/client-sdk/go/modules/evm"
 	"github.com/oasisprotocol/oasis-sdk/client-sdk/go/types"
 
 	"github.com/oasisprotocol/oasis-web3-gateway/archive"
@@ -28,6 +29,12 @@ import (
 	"github.com/oasisprotocol/oasis-web3-gateway/gas"
 	"github.com/oasisprotocol/oasis-web3-gateway/indexer"
 	"github.com/oasisprotocol/oasis-web3-gateway/rpc/utils"
+	"github.com/oasisprotocol/oasis-web3-gateway/source"
+)
+
+const (
+	// maxQueryLimit is the max number of requested percentiles.
+	maxQueryLimit = 100
 )
 
 func estimateGasDummySigSpec() types.SignatureAddressSpec {
@@ -42,6 +49,7 @@ var (
 	ErrMalformedTransaction = errors.New("malformed transaction")
 	ErrMalformedBlockNumber = errors.New("malformed blocknumber")
 	ErrInvalidRequest       = errors.New("invalid request")
+	ErrInvalidPercentile    = errors.New("invalid reward percentile")
 
 	// estimateGasSigSpec is a dummy signature spec used by the estimate gas method, as
 	// otherwise transactions without signature would be underestimated.
@@ -51,17 +59,21 @@ var (
 // API is the eth_ prefixed set of APIs in the Web3 JSON-RPC spec.
 type API interface {
 	// GetBlockByNumber returns the block identified by number.
-	GetBlockByNumber(ctx context.Context, blockNum ethrpc.BlockNumber, fullTx bool) (map[string]interface{}, error)
+	GetBlockByNumber(ctx context.Context, blockNum ethrpc.BlockNumber, fullTx bool) (map[string]any, error)
 	// GetBlockTransactionCountByNumber returns the number of transactions in the block.
 	GetBlockTransactionCountByNumber(ctx context.Context, blockNum ethrpc.BlockNumber) (hexutil.Uint, error)
 	// GetStorageAt returns the storage value at the provided position.
-	GetStorageAt(ctx context.Context, address common.Address, position hexutil.Big, blockNrOrHash ethrpc.BlockNumberOrHash) (hexutil.Big, error)
+	GetStorageAt(ctx context.Context, address common.Address, slot string, blockNrOrHash ethrpc.BlockNumberOrHash) (hexutil.Bytes, error)
 	// GetBalance returns the provided account's balance up to the provided block number.
 	GetBalance(ctx context.Context, address common.Address, blockNrOrHash ethrpc.BlockNumberOrHash) (*hexutil.Big, error)
 	// ChainId return the EIP-155 chain id for the current network.
 	ChainId() (*hexutil.Big, error)
 	// GasPrice returns a suggestion for a gas price for legacy transactions.
 	GasPrice(ctx context.Context) (*hexutil.Big, error)
+	// MaxPriorityFeePerGas returns a suggestion for a gas tip cap for dynamic fee transactions
+	MaxPriorityFeePerGas(ctx context.Context) (*hexutil.Big, error)
+	// FeeHistory returns the transaction base fee per gas and effective priority fee per gas for the requested/supported block range.
+	FeeHistory(ctx context.Context, blockCount math.HexOrDecimal64, lastBlock ethrpc.BlockNumber, rewardPercentiles []float64) (*gas.FeeHistoryResult, error)
 	// GetBlockTransactionCountByHash returns the number of transactions in the block identified by hash.
 	GetBlockTransactionCountByHash(ctx context.Context, blockHash common.Hash) (hexutil.Uint, error)
 	// GetTransactionCount returns the number of transactions the given address has sent for the given block number.
@@ -75,7 +87,7 @@ type API interface {
 	// EstimateGas returns an estimate of gas usage for the given transaction.
 	EstimateGas(ctx context.Context, args utils.TransactionArgs, blockNum *ethrpc.BlockNumber) (hexutil.Uint64, error)
 	// GetBlockByHash returns the block identified by hash.
-	GetBlockByHash(ctx context.Context, blockHash common.Hash, fullTx bool) (map[string]interface{}, error)
+	GetBlockByHash(ctx context.Context, blockHash common.Hash, fullTx bool) (map[string]any, error)
 	// GetTransactionByHash returns the transaction identified by hash.
 	GetTransactionByHash(ctx context.Context, hash common.Hash) (*utils.RPCTransaction, error)
 	// GetTransactionByBlockHashAndIndex returns the transaction for the given block hash and index.
@@ -83,7 +95,7 @@ type API interface {
 	// GetTransactionByBlockNumberAndIndex returns the transaction identified by number and index.
 	GetTransactionByBlockNumberAndIndex(ctx context.Context, blockNum ethrpc.BlockNumber, index hexutil.Uint) (*utils.RPCTransaction, error)
 	// GetTransactionReceipt returns the transaction receipt by hash.
-	GetTransactionReceipt(ctx context.Context, txHash common.Hash) (map[string]interface{}, error)
+	GetTransactionReceipt(ctx context.Context, txHash common.Hash) (map[string]any, error)
 	// GetLogs returns the ethereum logs.
 	GetLogs(ctx context.Context, filter filters.FilterCriteria) ([]*ethtypes.Log, error)
 	// GetBlockHash returns the block hash by the given number.
@@ -98,11 +110,11 @@ type API interface {
 	Hashrate() hexutil.Uint64
 	// Syncing returns false in case the node is currently not syncing with the network, otherwise
 	// returns syncing information.
-	Syncing(ctx context.Context) (interface{}, error)
+	Syncing(ctx context.Context) (any, error)
 }
 
 type publicAPI struct {
-	client         client.RuntimeClient
+	source         source.NodeSource
 	archiveClient  *archive.Client
 	backend        indexer.Backend
 	gasPriceOracle gas.Backend
@@ -113,7 +125,7 @@ type publicAPI struct {
 
 // NewPublicAPI creates an instance of the public ETH Web3 API.
 func NewPublicAPI(
-	client client.RuntimeClient,
+	source source.NodeSource,
 	archiveClient *archive.Client,
 	logger *logging.Logger,
 	chainID uint32,
@@ -122,7 +134,7 @@ func NewPublicAPI(
 	methodLimits *conf.MethodLimits,
 ) API {
 	return &publicAPI{
-		client:         client,
+		source:         source,
 		archiveClient:  archiveClient,
 		chainID:        chainID,
 		Logger:         logger,
@@ -166,9 +178,9 @@ func (api *publicAPI) roundParamFromBlockNum(ctx context.Context, logger *loggin
 		return client.RoundLatest, nil
 	case ethrpc.EarliestBlockNumber:
 		var earliest uint64
-		clrBlk, err := api.client.GetLastRetainedBlock(ctx)
+		clrBlk, err := api.source.GetLastRetainedBlock(ctx)
 		if err != nil {
-			logger.Error("failed to get last retained block from client", "err", err)
+			logger.Error("failed to get last retained block from source", "err", err)
 			return 0, ErrInternalError
 		}
 		ilrRound, err := api.backend.QueryLastRetainedRound(ctx)
@@ -176,11 +188,7 @@ func (api *publicAPI) roundParamFromBlockNum(ctx context.Context, logger *loggin
 			logger.Error("failed to get last retained block from indexer", "err", err)
 			return 0, ErrInternalError
 		}
-		if clrBlk.Header.Round < ilrRound {
-			earliest = ilrRound
-		} else {
-			earliest = clrBlk.Header.Round
-		}
+		earliest = max(clrBlk.Header.Round, ilrRound)
 		return earliest, nil
 	default:
 		if int64(blockNum) < 0 {
@@ -192,7 +200,7 @@ func (api *publicAPI) roundParamFromBlockNum(ctx context.Context, logger *loggin
 	}
 }
 
-func (api *publicAPI) GetBlockByNumber(ctx context.Context, blockNum ethrpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
+func (api *publicAPI) GetBlockByNumber(ctx context.Context, blockNum ethrpc.BlockNumber, fullTx bool) (map[string]any, error) {
 	logger := api.Logger.With("method", "eth_getBlockByNumber", "block_number", blockNum, "full_tx", fullTx)
 	logger.Debug("request")
 
@@ -225,33 +233,47 @@ func (api *publicAPI) GetBlockTransactionCountByNumber(ctx context.Context, bloc
 	return hexutil.Uint(n), nil
 }
 
-func (api *publicAPI) GetStorageAt(ctx context.Context, address common.Address, position hexutil.Big, blockNrOrHash ethrpc.BlockNumberOrHash) (hexutil.Big, error) {
-	logger := api.Logger.With("method", "eth_getStorageAt", "address", address, "position", position, "block_or_hash", blockNrOrHash)
+// These matches most other eth-compatible gateways, which are very lax about the slot hex encoding.
+func decodeHash(s string) (common.Hash, error) {
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		s = s[2:]
+	}
+	if (len(s) & 1) > 0 {
+		s = "0" + s
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("hex string invalid")
+	}
+	if len(b) > 32 {
+		return common.Hash{}, fmt.Errorf("hex string too long, want at most 32 bytes")
+	}
+	return common.BytesToHash(b), nil
+}
+
+func (api *publicAPI) GetStorageAt(ctx context.Context, address common.Address, slotHex string, blockNrOrHash ethrpc.BlockNumberOrHash) (hexutil.Bytes, error) {
+	logger := api.Logger.With("method", "eth_getStorageAt", "address", address, "slot", slotHex, "block_or_hash", blockNrOrHash)
 	logger.Debug("request")
+
+	slot, err := decodeHash(slotHex)
+	if err != nil {
+		return hexutil.Bytes{}, fmt.Errorf("invalid slot: %w", err)
+	}
 
 	round, err := api.getBlockRound(ctx, logger, blockNrOrHash)
 	if err != nil {
-		return hexutil.Big{}, err
+		return hexutil.Bytes{}, err
 	}
 	if api.shouldQueryArchive(round) {
-		return api.archiveClient.GetStorageAt(ctx, address, position, round)
+		return api.archiveClient.GetStorageAt(ctx, address, slot, round)
 	}
 
-	// EVM module takes index as H256, which needs leading zeros.
-	position256 := make([]byte, 32)
-	// Unmarshalling to hexutil.Big rejects overlong inputs. Verify in `TestRejectOverlong`.
-	position.ToInt().FillBytes(position256)
-
-	ethmod := evm.NewV1(api.client)
-	res, err := ethmod.Storage(ctx, round, address[:], position256)
+	res, err := api.source.EVMStorage(ctx, round, address[:], slot[:])
 	if err != nil {
 		logger.Error("failed to query storage", "err", err)
-		return hexutil.Big{}, ErrInternalError
+		return nil, ErrInternalError
 	}
-	// Some apps expect no leading zeros, so output as big integer.
-	var resultBI big.Int
-	resultBI.SetBytes(res)
-	return hexutil.Big(resultBI), nil
+	return res[:], nil
 }
 
 func (api *publicAPI) GetBalance(ctx context.Context, address common.Address, blockNrOrHash ethrpc.BlockNumberOrHash) (*hexutil.Big, error) {
@@ -266,10 +288,9 @@ func (api *publicAPI) GetBalance(ctx context.Context, address common.Address, bl
 		return api.archiveClient.GetBalance(ctx, address, round)
 	}
 
-	ethmod := evm.NewV1(api.client)
-	res, err := ethmod.Balance(ctx, round, address[:])
+	res, err := api.source.EVMBalance(ctx, round, address[:])
 	if err != nil {
-		logger.Error("ethmod.Balance failed", "round", round, "err", err)
+		logger.Error("failed to get balance", "round", round, "err", err)
 		return nil, ErrInternalError
 	}
 
@@ -288,6 +309,40 @@ func (api *publicAPI) GasPrice(_ context.Context) (*hexutil.Big, error) {
 	logger.Debug("request")
 
 	return api.gasPriceOracle.GasPrice(), nil
+}
+
+func (api *publicAPI) MaxPriorityFeePerGas(_ context.Context) (*hexutil.Big, error) {
+	logger := api.Logger.With("method", "eth_maxPriorityFeePerGas")
+	logger.Debug("request")
+
+	return api.gasPriceOracle.GasPrice(), nil
+}
+
+func (api *publicAPI) FeeHistory(_ context.Context, blockCount math.HexOrDecimal64, lastBlock ethrpc.BlockNumber, rewardPercentiles []float64) (*gas.FeeHistoryResult, error) {
+	logger := api.Logger.With("method", "eth_feeHistory", "block_count", blockCount, "last_block", lastBlock, "reward_percentiles", rewardPercentiles)
+	logger.Debug("request")
+
+	// Validate blockCount.
+	if blockCount < 1 {
+		// Returning with no data and no error means there are no retrievable blocks.
+		return &gas.FeeHistoryResult{OldestBlock: (*hexutil.Big)(common.Big0)}, nil
+	}
+
+	// Validate reward percentiles.
+	if len(rewardPercentiles) > maxQueryLimit {
+		return nil, fmt.Errorf("%w: over the query limit %d", ErrInvalidPercentile, maxQueryLimit)
+	}
+
+	for i, p := range rewardPercentiles {
+		if p < 0 || p > 100 {
+			return nil, fmt.Errorf("%w: %f", ErrInvalidPercentile, p)
+		}
+		if i > 0 && p <= rewardPercentiles[i-1] {
+			return nil, fmt.Errorf("%w: #%d:%f > #%d:%f", ErrInvalidPercentile, i-1, rewardPercentiles[i-1], i, p)
+		}
+	}
+
+	return api.gasPriceOracle.FeeHistory(uint64(blockCount), lastBlock, rewardPercentiles), nil
 }
 
 func (api *publicAPI) GetBlockTransactionCountByHash(ctx context.Context, blockHash common.Hash) (hexutil.Uint, error) {
@@ -314,10 +369,9 @@ func (api *publicAPI) GetTransactionCount(ctx context.Context, ethAddr common.Ad
 		return api.archiveClient.GetTransactionCount(ctx, ethAddr, round)
 	}
 
-	accountsMod := accounts.NewV1(api.client)
 	accountsAddr := types.NewAddressRaw(types.AddressV0Secp256k1EthContext, ethAddr[:])
 
-	nonce, err := accountsMod.Nonce(ctx, round, accountsAddr)
+	nonce, err := api.source.AccountsNonce(ctx, round, accountsAddr)
 	if err != nil {
 		logger.Error("accounts.Nonce failed", "err", err)
 		return nil, ErrInternalError
@@ -338,10 +392,9 @@ func (api *publicAPI) GetCode(ctx context.Context, address common.Address, block
 		return api.archiveClient.GetCode(ctx, address, round)
 	}
 
-	ethmod := evm.NewV1(api.client)
-	res, err := ethmod.Code(ctx, round, address[:])
+	res, err := api.source.EVMCode(ctx, round, address[:])
 	if err != nil {
-		logger.Error("ethmod.Code failed", "err", err)
+		logger.Error("failed to get code", "err", err)
 		return nil, err
 	}
 
@@ -396,7 +449,7 @@ func (api *publicAPI) Call(ctx context.Context, args utils.TransactionArgs, bloc
 		sender = *args.From
 	}
 
-	res, err := evm.NewV1(api.client).SimulateCall(
+	res, err := api.source.EVMSimulateCall(
 		ctx,            // context
 		round,          // round
 		gasPrice,       // gasPrice
@@ -434,7 +487,7 @@ func (api *publicAPI) SendRawTransaction(ctx context.Context, data hexutil.Bytes
 		},
 	}
 
-	err := api.client.SubmitTxNoWait(ctx, &utx)
+	err := api.source.SubmitTxNoWait(ctx, &utx)
 	if err != nil {
 		logger.Debug("failed to submit transaction", "err", err)
 		return ethTx.Hash(), err
@@ -478,15 +531,16 @@ func (api *publicAPI) EstimateGas(ctx context.Context, args utils.TransactionArg
 	}
 	if args.To == nil {
 		// evm.create
-		tx = evm.NewV1(api.client).Create(ethTxValue, *ethTxInput).AppendAuthSignature(estimateGasSigSpec, 0).GetTransaction()
+		tx = api.source.EVMCreate(ethTxValue, *ethTxInput)
 	} else {
 		// evm.call
-		tx = evm.NewV1(api.client).Call(args.To.Bytes(), ethTxValue, *ethTxInput).AppendAuthSignature(estimateGasSigSpec, 0).GetTransaction()
+		tx = api.source.EVMCall(args.To.Bytes(), ethTxValue, *ethTxInput)
 	}
+	tx.AppendAuthSignature(estimateGasSigSpec, 0)
 
 	var ethAddress [20]byte
 	copy(ethAddress[:], args.From[:])
-	gas, err := core.NewV1(api.client).EstimateGasForCaller(ctx, round, types.CallerAddress{EthAddress: &ethAddress}, tx, true)
+	gas, err := api.source.CoreEstimateGasForCaller(ctx, round, types.CallerAddress{EthAddress: &ethAddress}, tx, true)
 	if err != nil {
 		logger.Debug("failed", "err", err)
 		return 0, err
@@ -497,7 +551,7 @@ func (api *publicAPI) EstimateGas(ctx context.Context, args utils.TransactionArg
 	return hexutil.Uint64(gas), nil
 }
 
-func (api *publicAPI) GetBlockByHash(ctx context.Context, blockHash common.Hash, fullTx bool) (map[string]interface{}, error) {
+func (api *publicAPI) GetBlockByHash(ctx context.Context, blockHash common.Hash, fullTx bool) (map[string]any, error) {
 	logger := api.Logger.With("method", "eth_getBlockByHash", "block_hash", blockHash, "full_tx", fullTx)
 	logger.Debug("request")
 
@@ -553,7 +607,7 @@ func (api *publicAPI) GetTransactionByBlockNumberAndIndex(ctx context.Context, b
 	return api.GetTransactionByBlockHashAndIndex(ctx, blockHash, index)
 }
 
-func (api *publicAPI) GetTransactionReceipt(ctx context.Context, txHash common.Hash) (map[string]interface{}, error) {
+func (api *publicAPI) GetTransactionReceipt(ctx context.Context, txHash common.Hash) (map[string]any, error) {
 	logger := api.Logger.With("method", "eth_getTransactionReceipt", "hash", txHash)
 	logger.Debug("request")
 
@@ -632,8 +686,10 @@ func (api *publicAPI) GetLogs(ctx context.Context, filter filters.FilterCriteria
 		return nil, fmt.Errorf("%w: end round greater than start round", ErrInvalidRequest)
 	}
 
-	if limit := api.methodLimits.GetLogsMaxRounds; limit != 0 && endRoundInclusive-startRoundInclusive > limit {
-		return nil, fmt.Errorf("%w: max allowed of rounds in logs query is: %d", ErrInvalidRequest, limit)
+	if api.methodLimits != nil {
+		if limit := api.methodLimits.GetLogsMaxRounds; limit != 0 && endRoundInclusive-startRoundInclusive > limit {
+			return nil, fmt.Errorf("%w: max allowed of rounds in logs query is: %d", ErrInvalidRequest, limit)
+		}
 	}
 
 	ethLogs := []*ethtypes.Log{}
@@ -646,7 +702,6 @@ func (api *publicAPI) GetLogs(ctx context.Context, filter filters.FilterCriteria
 
 	// Early return if no further filtering.
 	if len(filter.Addresses) == 0 && len(filter.Topics) == 0 {
-		logger.Debug("response", "rsp", ethLogs)
 		return ethLogs, nil
 	}
 
@@ -673,7 +728,7 @@ func (api *publicAPI) GetLogs(ctx context.Context, filter filters.FilterCriteria
 		filtered = append(filtered, log)
 	}
 
-	logger.Debug("response", "rsp", filtered, "all_logs", ethLogs)
+	logger.Debug("response", "num_logs", len(filtered), "all_logs", ethLogs)
 	return filtered, nil
 }
 
@@ -723,7 +778,7 @@ func (api *publicAPI) Hashrate() hexutil.Uint64 {
 	return 0
 }
 
-func (api *publicAPI) Syncing(_ context.Context) (interface{}, error) {
+func (api *publicAPI) Syncing(_ context.Context) (any, error) {
 	logger := api.Logger.With("method", "eth_syncing")
 	logger.Debug("request")
 

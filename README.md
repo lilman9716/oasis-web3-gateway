@@ -11,7 +11,7 @@ Web3 Gateway for Oasis-SDK Paratime EVM module.
 
 ### Prerequisites
 
-- [Go](https://go.dev/) (at least version 1.22).
+- [Go](https://go.dev/) (at least version 1.25).
 - [PostgreSQL](https://www.postgresql.org/) (at least version 13.3).
 
 Additionally, for testing:
@@ -34,7 +34,7 @@ bind-mounting the runtime state directory (`/serverdir/node`) into your local
 filesystem.
 
 ```bash
-docker run --rm -ti -p5432:5432 -p8545:8545 -p8546:8546 -v /tmp/eth-runtime-test:/serverdir/node ghcr.io/oasisprotocol/sapphire-localnet:local -test-mnemonic -n 4
+docker run --rm -ti -p5432:5432 -p8544-8548:8544-8548 -v /tmp/eth-runtime-test:/serverdir/node ghcr.io/oasisprotocol/sapphire-localnet:local
 ```
 
 If needed, the `oasis-web3-gateway` or `sapphire-paratime` executables could also be
@@ -46,7 +46,7 @@ the full gateway & paratime stack together.
 For running tests, start the docker network without the gateway, by setting the `OASIS_DOCKER_NO_GATEWAY=yes` environment variable:
 
 ```bash
-docker run --rm -ti -e OASIS_DOCKER_NO_GATEWAY=yes -p5432:5432 -p8544-8546:8544-8546 -v /tmp/eth-runtime-test:/serverdir/node ghcr.io/oasisprotocol/sapphire-localnet:local -test-mnemonic -n 4
+docker run --rm -ti -e OASIS_DOCKER_NO_GATEWAY=yes -p5432:5432 -p8544-8548:8544-8548 -v /tmp/eth-runtime-test:/serverdir/node ghcr.io/oasisprotocol/sapphire-localnet:local
 ```
 
 Once bootstrapped, run the tests:

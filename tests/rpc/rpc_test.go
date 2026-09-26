@@ -24,7 +24,7 @@ import (
 	"github.com/oasisprotocol/oasis-web3-gateway/tests"
 )
 
-func createRequest(method string, params interface{}) Request {
+func createRequest(method string, params any) Request {
 	return Request{
 		Version: "2.0",
 		Method:  method,
@@ -33,7 +33,7 @@ func createRequest(method string, params interface{}) Request {
 	}
 }
 
-func call(t *testing.T, method string, params interface{}) *Response {
+func call(t *testing.T, method string, params any) *Response {
 	rawReq, err := json.Marshal(createRequest(method, params))
 	require.NoError(t, err)
 
@@ -63,7 +63,7 @@ func call(t *testing.T, method string, params interface{}) *Response {
 }
 
 //nolint:unparam
-func submitTransaction(ctx context.Context, t *testing.T, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *types.Receipt {
+func submitTransaction(ctx context.Context, t *testing.T, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte, legacy bool) *types.Receipt {
 	ec := localClient(t, false)
 	chainID, err := ec.ChainID(context.Background())
 	require.NoError(t, err)
@@ -81,6 +81,9 @@ func submitTransaction(ctx context.Context, t *testing.T, to common.Address, amo
 		data,
 	)
 	signer := types.LatestSignerForChainID(chainID)
+	if legacy {
+		signer = types.LatestSignerForChainID(nil)
+	}
 	signature, err := crypto.Sign(signer.Hash(tx).Bytes(), tests.TestKey1.Private)
 	require.Nil(t, err, "sign tx")
 
@@ -100,7 +103,7 @@ func submitTransaction(ctx context.Context, t *testing.T, to common.Address, amo
 func submitTestTransaction(ctx context.Context, t *testing.T) *types.Receipt {
 	data := common.FromHex("0x7f7465737432000000000000000000000000000000000000000000000000000000600057")
 	to := common.BytesToAddress(common.FromHex("0x1122334455667788990011223344556677889900"))
-	return submitTransaction(ctx, t, to, big.NewInt(1), GasLimit, GasPrice, data)
+	return submitTransaction(ctx, t, to, big.NewInt(1), GasLimit, GasPrice, data, false)
 }
 
 func TestEth_GetBalance(t *testing.T) {
@@ -114,7 +117,7 @@ func TestEth_GetBalance(t *testing.T) {
 }
 
 func getNonce(t *testing.T, from string) hexutil.Uint64 {
-	param := []interface{}{from, "latest"}
+	param := []any{from, "latest"}
 	rpcRes := call(t, "eth_getTransactionCount", param)
 
 	var nonce hexutil.Uint64
@@ -146,12 +149,82 @@ func TestEth_GasPrice(t *testing.T) {
 	t.Logf("gas price: %v", price)
 }
 
+func TestEth_MaxPriorityFeePerGas(t *testing.T) {
+	ec := localClient(t, false)
+
+	price, err := ec.SuggestGasTipCap(context.Background())
+	require.Nil(t, err, "get maxPriorityFeePerGas")
+
+	t.Logf("max priority fee per gas: %v", price)
+}
+
+func TestEth_FeeHistory(t *testing.T) {
+	ec := localClient(t, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), OasisBlockTimeout)
+	defer cancel()
+
+	// Submit some test transactions.
+	for i := 0; i < 5; i++ {
+		receipt := submitTestTransaction(ctx, t)
+		require.EqualValues(t, 1, receipt.Status)
+		require.NotNil(t, receipt)
+	}
+
+	// Base fee history test.
+	feeHistory, err := ec.FeeHistory(context.Background(), 10, nil, []float64{25, 50, 75, 100})
+	require.NoError(t, err, "get fee history")
+
+	t.Logf("fee history: %v", feeHistory)
+	require.Len(t, feeHistory.BaseFee, 10, "fee history base fee should have 10 elements")
+	for _, fee := range feeHistory.BaseFee {
+		require.Greater(t, fee.Int64(), int64(0), "base fee should be greater than 0")
+	}
+	require.Len(t, feeHistory.Reward, 10, "fee history reward should have 10 elements")
+
+	// More cases.
+	for _, tc := range []struct {
+		name        string
+		blockCount  uint64
+		lastBlock   *big.Int
+		percentiles []float64
+		expectErr   bool
+	}{
+		{name: "Query with no reward percentiles", blockCount: 5, lastBlock: nil, percentiles: nil, expectErr: false},
+		{name: "Query specific block range", blockCount: 3, lastBlock: big.NewInt(5), percentiles: []float64{50}, expectErr: false},
+		{name: "Query specific block range (large)", blockCount: 3, lastBlock: big.NewInt(100000), percentiles: []float64{50}, expectErr: false},
+		{name: "Query with zero block count (empty response)", blockCount: 0, lastBlock: nil, percentiles: []float64{50}, expectErr: false},
+		{name: "Query large block count", blockCount: 10_000, lastBlock: big.NewInt(11_000), percentiles: []float64{50}, expectErr: false},
+		{name: "Invalid percentile", blockCount: 5, lastBlock: nil, percentiles: []float64{150}, expectErr: true}, // Invalid percentile > 100
+	} {
+		_, err := ec.FeeHistory(ctx, tc.blockCount, tc.lastBlock, tc.percentiles)
+		switch tc.expectErr {
+		case true:
+			require.Error(t, err, tc.name)
+		default:
+			require.NoError(t, err, tc.name)
+		}
+	}
+}
+
 // TestEth_SendRawTransaction post eth raw transaction with ethclient from go-ethereum.
 func TestEth_SendRawTransaction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), OasisBlockTimeout)
 	defer cancel()
 
-	receipt := submitTransaction(ctx, t, common.Address{1}, big.NewInt(1), GasLimit, GasPrice, nil)
+	receipt := submitTransaction(ctx, t, common.Address{1}, big.NewInt(1), GasLimit, GasPrice, nil, false)
+	require.EqualValues(t, 1, receipt.Status)
+}
+
+func TestEth_SendRawLegacyTransaction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), OasisBlockTimeout)
+	defer cancel()
+
+	// Legacy transactions are only supported on Sapphire (Emerald was not updated, since support was added).
+	ec := localClient(t, false)
+	skipIfNotSapphire(t, ec)
+
+	receipt := submitTransaction(ctx, t, common.Address{1}, big.NewInt(1), GasLimit, GasPrice, nil, true)
 	require.EqualValues(t, 1, receipt.Status)
 }
 
@@ -191,9 +264,9 @@ func TestEth_GetBlockByNumberAndGetBlockByHash(t *testing.T) {
 	// accessible by go-ethereum. To overcome this, we perform getBlockByNumber
 	// query with raw HTTP client and use the block's hash from that response.
 	// For details, see https://github.com/oasisprotocol/oasis-web3-gateway/issues/72
-	param := []interface{}{fmt.Sprintf("0x%x", number), false}
+	param := []any{fmt.Sprintf("0x%x", number), false}
 	rpcRes := call(t, "eth_getBlockByNumber", param)
-	blk2 := make(map[string]interface{})
+	blk2 := make(map[string]any)
 	err = json.Unmarshal(rpcRes.Result, &blk2)
 	require.NoError(t, err)
 	require.Equal(t, fmt.Sprintf("0x%x", number), blk2["number"])
@@ -270,7 +343,7 @@ func TestEth_GetTransactionByHash(t *testing.T) {
 	input := "0x7f7465737432000000000000000000000000000000000000000000000000000000600057"
 	data := common.FromHex(input)
 	to := common.BytesToAddress(common.FromHex("0x1122334455667788990011223344556677889900"))
-	receipt := submitTransaction(ctx, t, to, big.NewInt(1), GasLimit, GasPrice, data)
+	receipt := submitTransaction(ctx, t, to, big.NewInt(1), GasLimit, GasPrice, data, false)
 	require.EqualValues(t, 1, receipt.Status)
 	require.NotNil(t, receipt)
 
@@ -281,7 +354,7 @@ func TestEth_GetTransactionByHash(t *testing.T) {
 	require.Equal(t, tx2.Hash(), receipt.TxHash)
 
 	// Ensure `input` field in response is correctly encoded.
-	rsp := make(map[string]interface{})
+	rsp := make(map[string]any)
 	rawRsp := call(t, "eth_getTransactionByHash", []string{receipt.TxHash.Hex()})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &rsp))
 	require.Equal(t, input, rsp["input"], "getTransactionByHash 'input' response should be correct")
@@ -303,7 +376,7 @@ func TestEth_GetTransactionByBlockAndIndex(t *testing.T) {
 	input := "0x7f7465737432000000000000000000000000000000000000000000000000000000600057"
 	data := common.FromHex(input)
 	to := common.BytesToAddress(common.FromHex("0x1122334455667788990011223344556677889900"))
-	receipt := submitTransaction(ctx, t, to, big.NewInt(1), GasLimit, GasPrice, data)
+	receipt := submitTransaction(ctx, t, to, big.NewInt(1), GasLimit, GasPrice, data, false)
 	require.EqualValues(t, 1, receipt.Status)
 	require.NotNil(t, receipt)
 
@@ -314,13 +387,13 @@ func TestEth_GetTransactionByBlockAndIndex(t *testing.T) {
 	require.Equal(t, tx2.Hash(), receipt.TxHash)
 
 	// Test eth_getTransactionByBlockHashAndIndex.
-	rsp := make(map[string]interface{})
+	rsp := make(map[string]any)
 	rawRsp := call(t, "eth_getTransactionByBlockHashAndIndex", []string{receipt.BlockHash.Hex(), hexutil.Uint(receipt.TransactionIndex).String()})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &rsp))
 	require.Equal(t, input, rsp["input"], "getTransactionByHash 'input' response should be correct")
 
 	// Test eth_getTransactionByBlockNumberAndIndex.
-	rsp = make(map[string]interface{})
+	rsp = make(map[string]any)
 	rawRsp = call(t, "eth_getTransactionByBlockNumberAndIndex", []string{hexutil.EncodeBig(receipt.BlockNumber), hexutil.Uint(receipt.TransactionIndex).String()})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &rsp))
 	require.Equal(t, input, rsp["input"], "getTransactionByHash 'input' response should be correct")
@@ -336,28 +409,28 @@ func TestEth_GetBlockByHashRawResponses(t *testing.T) {
 	require.NotNil(t, receipt)
 
 	// GetBlockByHash(fullTx=false).
-	rsp := make(map[string]interface{})
-	rawRsp := call(t, "eth_getBlockByHash", []interface{}{receipt.BlockHash.Hex(), false})
+	rsp := make(map[string]any)
+	rawRsp := call(t, "eth_getBlockByHash", []any{receipt.BlockHash.Hex(), false})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &rsp))
 
-	transactions := rsp["transactions"].([]interface{})
+	transactions := rsp["transactions"].([]any)
 	// There should be one transaction in response.
 	require.EqualValues(t, 1, len(transactions))
 	// The transaction should be a hash.
 	require.IsType(t, "string", transactions[0], "getBlockByHash(fullTx=false) should only return transaction hashes")
 
 	// GetBlockByHash(fullTx=true).
-	rawRsp = call(t, "eth_getBlockByHash", []interface{}{receipt.BlockHash.Hex(), true})
+	rawRsp = call(t, "eth_getBlockByHash", []any{receipt.BlockHash.Hex(), true})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &rsp))
 
-	transactions = rsp["transactions"].([]interface{})
+	transactions = rsp["transactions"].([]any)
 	// There should be one transaction in response.
 	require.EqualValues(t, 1, len(transactions))
 	// The transaction should be an object.
-	require.IsType(t, make(map[string]interface{}), transactions[0], "getBlockByHash(fullTx=true) should only return full transaction objects")
+	require.IsType(t, make(map[string]any), transactions[0], "getBlockByHash(fullTx=true) should only return full transaction objects")
 
 	// The transaction in getBlockByHash should match transaction obtained by getTransactionByHash.
-	txRsp := make(map[string]interface{})
+	txRsp := make(map[string]any)
 	rawRsp = call(t, "eth_getTransactionByHash", []string{receipt.TxHash.Hex()})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &txRsp))
 	require.EqualValues(t, transactions[0], txRsp, "getBlockByHash.transaction should match getTransactionByHash response")
@@ -373,13 +446,13 @@ func TestEth_GetTransactionReceiptRawResponses(t *testing.T) {
 	require.NotNil(t, receipt)
 
 	// GetTransactionReceipt.
-	rsp := make(map[string]interface{})
-	rawRsp := call(t, "eth_getTransactionReceipt", []interface{}{receipt.TxHash.Hex()})
+	rsp := make(map[string]any)
+	rawRsp := call(t, "eth_getTransactionReceipt", []any{receipt.TxHash.Hex()})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &rsp))
 	require.Nil(t, rsp["contractAddress"], "contract address should be nil")
 
 	// Non existing transaction receipt.
-	rawRsp = call(t, "eth_getTransactionReceipt", []interface{}{common.Hash{}})
+	rawRsp = call(t, "eth_getTransactionReceipt", []any{common.Hash{}})
 	require.NoError(t, json.Unmarshal(rawRsp.Result, &rsp))
 	require.Empty(t, rsp, "nonexistent receipt should be empty")
 }
