@@ -24,6 +24,13 @@ require (
 	github.com/oasisprotocol/oasis-sdk/client-sdk/go v0.16.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/cors v1.11.1
+	github.com/spf13/cobra v1.8.1
+	github.com/stretchr/testify v1.9.0
+	github.com/uptrace/bun v1.2.8
+	github.com/uptrace/bun/dialect/pgdialect v1.2.8
+	github.com/uptrace/bun/driver/pgdriver v1.2.8
+	golang.org/x/crypto v0.31.0
+	google.golang.org/grpc v1.66.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	github.com/uptrace/bun v1.2.16
@@ -173,6 +180,9 @@ require (
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	lukechampine.com/blake3 v1.2.2 // indirect
+	mellium.im/sasl v0.3.2 // indirect
+	rsc.io/tmplfunc v0.0.3 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
